@@ -52,6 +52,7 @@ function toText<T>(data: T) {
 	}
 	return data;
 }
+
 export class HttpRequestV3 implements INodeType {
 	description: INodeTypeDescription;
 
@@ -466,7 +467,74 @@ export class HttpRequestV3 implements INodeType {
 				// Change the way data get send in case a different content-type than JSON got selected
 				if (sendBody && ['PATCH', 'POST', 'PUT', 'GET'].includes(requestMethod)) {
 					if (bodyContentType === 'multipart-form-data') {
-						requestOptions.formData = requestOptions.body as IDataObject;
+						// FIX: Handle binary file parameters in multipart/form-data for queue mode
+						const formData = requestOptions.body as IDataObject;
+						
+						// Process each form field to handle binary file parameters
+						if (formData) {
+							for (const key of Object.keys(formData)) {
+								const value = formData[key];
+								
+								// Check if this is a binary file parameter (could be object or stringified JSON)
+								let binaryConfig: IDataObject | null = null;
+								
+								if (value && typeof value === 'object' && (value as IDataObject).parameterType === 'formBinary') {
+									binaryConfig = value as IDataObject;
+								} else if (typeof value === 'string') {
+									try {
+										const parsed = JSON.parse(value);
+										if (parsed?.parameterType === 'formBinary') {
+											binaryConfig = parsed;
+										}
+									} catch (e) {
+										// Not JSON, treat as regular value
+									}
+								}
+								
+								if (binaryConfig) {
+									const binaryPropertyName = binaryConfig.value as string;
+									
+									// Get binary data buffer - works in all modes including queue
+									const binaryDataBuffer = await this.helpers.getBinaryDataBuffer(itemIndex, binaryPropertyName);
+									
+									if (!binaryDataBuffer) {
+										throw new NodeOperationError(
+											this.getNode(),
+											`Binary data not found for property: ${binaryPropertyName}`,
+											{ itemIndex }
+										);
+									}
+									
+									// Get binary metadata - safely handle missing metadata (queue mode)
+									let fileName = 'file.bin';
+									let mimeType = 'application/octet-stream';
+									
+									try {
+										const binaryData = await this.helpers.getBinaryData(itemIndex, binaryPropertyName);
+										if (binaryData?.fileName) {
+											fileName = binaryData.fileName;
+										}
+										if (binaryData?.mimeType) {
+											mimeType = binaryData.mimeType;
+										}
+									} catch (e) {
+										// Metadata not available - use defaults
+										// This is expected in queue mode, not an error
+									}
+									
+									// Replace the stringified config with proper form-data object
+									formData[key] = {
+										value: binaryDataBuffer,
+										options: {
+											filename: fileName,
+											contentType: mimeType,
+										}
+									};
+								}
+							}
+						}
+						
+						requestOptions.formData = formData;
 						delete requestOptions.body;
 					} else if (bodyContentType === 'form-urlencoded') {
 						requestOptions.form = requestOptions.body as IDataObject;
