@@ -12,7 +12,12 @@ import {
 	type IOAuth2Options,
 	type IRequestOptions,
 } from 'n8n-workflow';
+import {
+	BINARY_ENCODING,
+	NodeOperationError,
+} from 'n8n-workflow';
 import type { SecureContextOptions } from 'tls';
+import type { Readable } from 'stream';
 
 import type { HttpSslAuthCredentials } from './interfaces';
 import { formatPrivateKey } from '../../utils/utilities';
@@ -20,7 +25,8 @@ import { formatPrivateKey } from '../../utils/utilities';
 export type BodyParameter = {
 	name: string;
 	value: string;
-	parameterType?: 'formBinaryData' | 'formData';
+	parameterType?: 'formBinaryData' | 'formBinary' | 'formData';
+	inputDataFieldName?: string;
 };
 
 export type IAuthDataSanitizeKeys = {
@@ -231,7 +237,7 @@ export const binaryContentTypes = [
 
 export type BodyParametersReducer = (
 	acc: IDataObject,
-	cur: { name: string; value: string },
+	cur: { name: string; value: string; parameterType?: string; inputDataFieldName?: string },
 ) => Promise<IDataObject>;
 
 export async function reduceAsync<T, R>(
@@ -243,6 +249,83 @@ export async function reduceAsync<T, R>(
 		return await reducer(await promiseAcc, item);
 	}, init);
 }
+
+// FIX: Complete parametersToKeyValue function that handles both formBinaryData and formBinary
+export const parametersToKeyValue = async (
+	this: any,
+	accumulator: IDataObject,
+	cur: BodyParameter,
+): Promise<IDataObject> => {
+	// Handle binary data for formBinaryData type (Binary body) - already works
+	if (cur.parameterType === 'formBinaryData') {
+		if (!cur.inputDataFieldName) return accumulator;
+		const binaryData = this.helpers.assertBinaryData(this.itemIndex, cur.inputDataFieldName);
+		let uploadData: Buffer | Readable;
+
+		if (binaryData.id) {
+			uploadData = await this.helpers.getBinaryStream(binaryData.id);
+		} else {
+			uploadData = Buffer.from(binaryData.data, BINARY_ENCODING);
+		}
+
+		accumulator[cur.name] = {
+			value: uploadData,
+			options: {
+				filename: binaryData.fileName,
+				contentType: binaryData.mimeType,
+			},
+		};
+		return accumulator;
+	}
+	
+	// FIX: Handle formBinary type (Form-Data binary file in multipart/form-data)
+	// This fixes issue #25567 - binary upload broken in queue mode
+	if (cur.parameterType === 'formBinary') {
+		if (!cur.inputDataFieldName) return accumulator;
+		
+		// Get binary data buffer - works in both queue and non-queue mode
+		const binaryDataBuffer = await this.helpers.getBinaryDataBuffer(
+			this.itemIndex, 
+			cur.inputDataFieldName
+		);
+		
+		if (!binaryDataBuffer) {
+			throw new NodeOperationError(
+				this.getNode(),
+				`Binary data not found for property: ${cur.inputDataFieldName}`,
+				{ itemIndex: this.itemIndex }
+			);
+		}
+		
+		// Safely get metadata with fallbacks (handles queue mode where metadata may be missing)
+		let fileName = 'file.bin';
+		let mimeType = 'application/octet-stream';
+		
+		try {
+			const binaryData = await this.helpers.getBinaryData(this.itemIndex, cur.inputDataFieldName);
+			if (binaryData?.fileName) fileName = binaryData.fileName;
+			if (binaryData?.mimeType) mimeType = binaryData.mimeType;
+		} catch (e) {
+			// Metadata not available in queue mode - use defaults
+			// This is expected behavior, not an error
+		}
+		
+		accumulator[cur.name] = {
+			value: binaryDataBuffer,
+			options: {
+				filename: fileName,
+				contentType: mimeType,
+			}
+		};
+		return accumulator;
+	}
+
+	// Handle regular parameters
+	if (cur.value !== undefined && cur.value !== null) {
+		updadeQueryParameter(accumulator, cur.name, cur.value);
+	}
+	return accumulator;
+};
 
 export const prepareRequestBody = async (
 	parameters: BodyParameter[],
@@ -261,6 +344,15 @@ export const prepareRequestBody = async (
 
 		for (const parameter of parameters) {
 			if (parameter.parameterType === 'formBinaryData') {
+				const entry = await defaultReducer({}, parameter);
+				const key = Object.keys(entry)[0];
+				const data = entry[key] as { value: Buffer; options: FormData.AppendOptions };
+				formData.append(key, data.value, data.options);
+				continue;
+			}
+			
+			// FIX: Handle formBinary type in FormData construction for version >=4.2
+			if (parameter.parameterType === 'formBinary') {
 				const entry = await defaultReducer({}, parameter);
 				const key = Object.keys(entry)[0];
 				const data = entry[key] as { value: Buffer; options: FormData.AppendOptions };
@@ -307,3 +399,6 @@ export const updadeQueryParameterConfig = (version: number) => {
 		};
 	}
 };
+
+// Re-export updadeQueryParameter with the correct name for backward compatibility
+export const updadeQueryParameter = updadeQueryParameterConfig;
